@@ -3,117 +3,100 @@
 # Copyright 2025 Canonical Ltd.
 # See LICENSE file for licensing details.
 
-# Learn more at: https://documentation.ubuntu.com/juju/3.6/howto/manage-charms/#build-a-charm
-
-"""Charm the service.
-
-Refer to the following post for a quick-start guide that will help you
-develop a new k8s charm using the Operator Framework:
-
-https://discourse.charmhub.io/t/4208
-"""
+"""Postfix Relay Configurator charm."""
 
 import logging
-import typing
+import socket
+from pathlib import Path
+from typing import Any
 
 import ops
-from ops import pebble
 
-# Log messages can be retrieved using juju debug-log
+import utils
+from postfix import (
+    PostfixMap,
+    build_postfix_maps,
+    construct_policyd_spf_config_file_content,
+    construct_postfix_config_params,
+)
+from state import ConfigurationError, State
+
 logger = logging.getLogger(__name__)
 
-VALID_LOG_LEVELS = ["info", "debug", "warning", "error", "critical"]
+TEMPLATES_DIRPATH = Path("templates")
+FILES_DIRPATH = Path("files")
+
+POSTFIX_CONF_DIRPATH = Path("/etc/postfix")
+POLICYD_SPF_FILEPATH = Path("/etc/postfix-policyd-spf-python/policyd-spf.conf")
+MAIN_CF = "main.cf"
+MAIN_CF_TMPL = "postfix_main_cf.tmpl"
+MASTER_CF = "master.cf"
+MASTER_CF_TMPL = "postfix_master_cf.tmpl"
+
+DOVECOT_NAME = "dovecot"
+DOVECOT_CONFIG_FILEPATH = Path("/etc/dovecot/dovecot.conf")
+DOVECOT_USERS_FILEPATH = Path("/etc/dovecot/users")
 
 
-class IsCharmsTemplateCharm(ops.CharmBase):
-    """Charm the service."""
+class PostfixRelayConfiguratorCharm(ops.CharmBase):
+    """Postfix Relay Configurator."""
 
-    def __init__(self, *args: typing.Any):
-        """Construct.
-
-        Args:
-            args: Arguments passed to the CharmBase parent constructor.
-        """
+    def __init__(self, *args: Any) -> None:
+        """Postfix Relay Configurator."""
         super().__init__(*args)
-        self.framework.observe(self.on.httpbin_pebble_ready, self._on_httpbin_pebble_ready)
-        self.framework.observe(self.on.config_changed, self._on_config_changed)
 
-    def _on_httpbin_pebble_ready(self, event: ops.PebbleReadyEvent) -> None:
-        """Define and start a workload using the Pebble API.
+        self.framework.observe(self.on.config_changed, self._reconcile)
 
-        Change this example to suit your needs. You'll need to specify the right entrypoint and
-        environment configuration for your specific workload.
+    def _reconcile(self, _: ops.EventBase) -> None:
+        self.unit.status = ops.MaintenanceStatus("Reconciling config")
+        try:
+            charm_state = State.from_charm(self.config)
+        except ConfigurationError:
+            logger.exception("Error validating the charm configuration.")
+            self.unit.status = ops.BlockedStatus("Invalid config")
+            return
 
-        Learn more about interacting with Pebble at at
-        https://documentation.ubuntu.com/juju/3.6/reference/pebble/.
-
-        Args:
-            event: event triggering the handler.
-        """
-        # Get a reference the container attribute on the PebbleReadyEvent
-        container = event.workload
-        # Add initial Pebble config layer using the Pebble API
-        container.add_layer("httpbin", self._pebble_layer, combine=True)
-        # Make Pebble reevaluate its plan, ensuring any services are started if enabled.
-        container.replan()
-        # Learn more about statuses in the SDK docs:
-        # https://documentation.ubuntu.com/juju/latest/reference/status/index.html
+        self._configure_relay(charm_state)
+        self._configure_policyd_spf(charm_state)
         self.unit.status = ops.ActiveStatus()
 
-    def _on_config_changed(self, event: ops.ConfigChangedEvent) -> None:
-        """Handle changed configuration.
+    def _configure_relay(self, charm_state: State) -> None:
+        """Generate and apply Postfix configuration."""
+        self.unit.status = ops.MaintenanceStatus("Setting up Postfix relay")
 
-        Change this example to suit your needs. If you don't need to handle config, you can remove
-        this method.
+        hostname = socket.gethostname()
+        context = construct_postfix_config_params(
+            charm_state=charm_state,
+            hostname=hostname,
+        )
+        contents = utils.render_jinja2_template(context, TEMPLATES_DIRPATH / MAIN_CF_TMPL)
+        utils.write_file(contents, POSTFIX_CONF_DIRPATH / MAIN_CF)
+        contents = utils.render_jinja2_template(context, TEMPLATES_DIRPATH / MASTER_CF_TMPL)
+        utils.write_file(contents, POSTFIX_CONF_DIRPATH / MASTER_CF)
 
-        Learn more about config at
-        https://canonical-charmcraft.readthedocs-hosted.com/stable/reference/files/config-yaml-file/
+        postfix_maps = build_postfix_maps(POSTFIX_CONF_DIRPATH, charm_state)
+        self._apply_postfix_maps(list(postfix_maps.values()))
 
-        Args:
-            event: event triggering the handler.
-        """
-        # Fetch the new config value
-        log_level = str(self.model.config["log-level"]).lower()
+        logger.info("Updating aliases")
 
-        # Do some validation of the configuration option
-        if log_level in VALID_LOG_LEVELS:
-            # The config is good, so update the configuration of the workload
-            container = self.unit.get_container("httpbin")
-            # Verify that we can connect to the Pebble API in the workload container
-            if container.can_connect():
-                # Push an updated layer with the new config
-                container.add_layer("httpbin", self._pebble_layer, combine=True)
-                container.replan()
+    @staticmethod
+    def _apply_postfix_maps(postfix_maps: list[PostfixMap]) -> None:
+        logger.info("Applying postfix maps")
+        for postfix_map in postfix_maps:
+            utils.write_file(postfix_map.content, postfix_map.path)
 
-                logger.debug("Log level for gunicorn changed to '%s'", log_level)
-                self.unit.status = ops.ActiveStatus()
-            else:
-                # We were unable to connect to the Pebble API, so we defer this event
-                event.defer()
-                self.unit.status = ops.WaitingStatus("waiting for Pebble API")
-        else:
-            # In this case, the config option is bad, so block the charm and notify the operator.
-            self.unit.status = ops.BlockedStatus("invalid log level: '{log_level}'")
+    def _configure_policyd_spf(self, charm_state: State) -> None:
+        """Configure Postfix SPF policy server (policyd-spf) based on charm state."""
+        self.unit.status = ops.MaintenanceStatus("Configuring Postfix policy server")
+        if not charm_state.enable_spf:
+            logger.info("Postfix policy server for SPF checking (policyd-spf) disabled")
+            return
 
-    @property
-    def _pebble_layer(self) -> pebble.LayerDict:
-        """Return a dictionary representing a Pebble layer."""
-        return {
-            "summary": "httpbin layer",
-            "description": "pebble config layer for httpbin",
-            "services": {
-                "httpbin": {
-                    "override": "replace",
-                    "summary": "httpbin",
-                    "command": "gunicorn -b 0.0.0.0:80 httpbin:app -k gevent",
-                    "startup": "enabled",
-                    "environment": {
-                        "GUNICORN_CMD_ARGS": f"--log-level {self.model.config['log-level']}"
-                    },
-                }
-            },
-        }
+        logger.info("Setting up Postfix policy server for SPF checking (policyd-spf)")
+
+        contents = construct_policyd_spf_config_file_content(charm_state.spf_skip_addresses)
+        utils.write_file(contents, POLICYD_SPF_FILEPATH)
 
 
 if __name__ == "__main__":  # pragma: nocover
-    ops.main(IsCharmsTemplateCharm)
+    ops.main(PostfixRelayConfiguratorCharm)

@@ -1,0 +1,72 @@
+#{{JUJU_HEADER}}
+smtpd_banner = $myhostname ESMTP $mail_name (Ubuntu)
+biff = no
+
+append_dot_mydomain = no
+
+readme_directory = no
+
+# See http://www.postfix.org/COMPATIBILITY_README.html -- default to 2 on
+# fresh installs.
+compatibility_level = 2
+
+message_size_limit = 50000000
+strict_rfc821_envelopes = yes
+smtpd_helo_required = yes
+smtpd_relay_restrictions = {{smtpd_relay_restrictions}}
+alias_maps = hash:/etc/aliases
+alias_database = hash:/etc/aliases
+mydestination = $myhostname, {{hostname}}, localhost.localdomain, localhost
+relayhost ={% if relayhost %} {{relayhost}}{% endif %}
+mynetworks = 127.0.0.0/8 [::ffff:127.0.0.0]/104 [::1]/128{% if mynetworks %} {{mynetworks}}{% endif %}
+mailbox_size_limit = 0
+recipient_delimiter = +
+inet_interfaces = all
+inet_protocols = all
+
+{% if enable_smtp_auth -%}
+broken_sasl_auth_clients = yes
+smtpd_sasl_auth_enable = yes
+smtpd_sasl_security_options = noanonymous
+smtpd_sasl_type = dovecot
+smtpd_sasl_path = private/auth
+{% if enable_sender_login_map -%}
+smtpd_sender_login_maps = hash:/etc/postfix/sender_login
+{% endif -%}
+smtpd_tls_auth_only = yes
+{% endif -%}
+{% if smtpd_recipient_restrictions -%}
+smtpd_recipient_restrictions = {{smtpd_recipient_restrictions}}
+{% endif -%}
+{% if restrict_recipients -%}
+smtpd_restriction_classes = restricted
+{% endif -%}
+smtpd_sender_restrictions = {{smtpd_sender_restrictions}}
+{% if restrict_recipients -%}
+restricted = check_recipient_access hash:/etc/postfix/restricted_recipients, reject
+{% endif -%}
+{% if enable_spf %}
+policyd-spf_time_limit = 3600s
+{% endif -%}
+
+header_checks = regexp:/etc/postfix/header_checks
+smtp_header_checks = regexp:/etc/postfix/smtp_header_checks
+
+{%- if virtual_alias_domains %}
+virtual_alias_domains = {{virtual_alias_domains}}
+{%- endif %}
+{%- if relay_domains %}
+relay_domains = {{relay_domains}}
+{% endif %}
+
+{%- if transport_maps %}
+transport_maps = hash:/etc/postfix/transport
+{% endif %}
+{%- if virtual_alias_maps -%}
+virtual_alias_maps = {{virtual_alias_maps_type}}:/etc/postfix/virtual_alias
+{% endif %}
+{%- if relay_recipient_maps_combined -%}
+relay_recipient_maps = ${virtual_alias_maps}, ${transport_maps}
+{% elif relay_recipient_maps %}
+relay_recipient_maps = hash:/etc/postfix/relay_recipient
+{% endif %}
