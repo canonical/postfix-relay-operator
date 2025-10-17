@@ -7,12 +7,25 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
 import utils
-from state import PostfixLookupTableType
+from state import AccessMapValue, PostfixLookupTableType
 
 if TYPE_CHECKING:
     from pydantic import IPvAnyNetwork
 
     from state import State
+
+
+POSTFIX_CONF_DIRPATH = Path("/etc/postfix")
+POSTFIX_MAP_FILES = [
+    "hash:/etc/postfix/relay_recipient",
+    "hash:/etc/postfix/restricted_recipients",
+    "hash:/etc/postfix/restricted_senders",
+    "hash:/etc/postfix/access",
+    "hash:/etc/postfix/sender_login",
+    "hash:/etc/postfix/tls_policy",
+    "hash:/etc/postfix/transport",
+    "hash:/etc/postfix/virtual_alias",
+]
 
 
 def _smtpd_relay_restrictions(charm_state: "State") -> list[str]:
@@ -94,10 +107,8 @@ def construct_postfix_config_params(  # pylint: disable=too-many-arguments
         "hostname": hostname,
         "connection_limit": charm_state.connection_limit,
         "enable_rate_limits": charm_state.enable_rate_limits,
-        "enable_sender_login_map": bool(charm_state.sender_login_maps),
         "enable_smtp_auth": charm_state.enable_smtp_auth,
         "enable_spf": charm_state.enable_spf,
-        "enable_tls_policy_map": bool(charm_state.tls_policy_maps),
         "header_checks": bool(charm_state.header_checks),
         "milter": milters,
         "mynetworks": ",".join(charm_state.allowed_relay_networks),
@@ -146,17 +157,15 @@ class PostfixMap(NamedTuple):
         return f"{self.type.value}:{self.path}"
 
 
-def build_postfix_maps(postfix_conf_dir: str, charm_state: "State") -> dict[str, PostfixMap]:
+def build_postfix_maps(charm_state: "State") -> dict[str, PostfixMap]:
     """Ensure various postfix files exist and are up-to-date with the current charm state.
 
     Args:
-        postfix_conf_dir: directory where postfix config files are stored.
         charm_state: current charm state.
 
     Returns:
         A dictionary mapping map names to the generated PostfixMap objects.
     """
-    postfix_conf_dir_path = Path(postfix_conf_dir)
 
     def _create_map(type_: str | PostfixLookupTableType, name: str, content: str) -> PostfixMap:
         type_ = (
@@ -164,57 +173,16 @@ def build_postfix_maps(postfix_conf_dir: str, charm_state: "State") -> dict[str,
         )
         return PostfixMap(
             type=type_,
-            path=postfix_conf_dir_path / name,
+            path=POSTFIX_CONF_DIRPATH / name,
             content=f"{utils.JUJU_HEADER}\n{content}\n",
         )
 
     # Create a map of all the maps we may need to create/update from the charm state.
     maps = {
-        "append_envelope_to_header": _create_map(
-            PostfixLookupTableType.REGEXP,
-            "append_envelope_to_header",
-            "/^(.*)$/ PREPEND X-Envelope-To: $1",
-        ),
         "header_checks": _create_map(
             PostfixLookupTableType.REGEXP,
             "header_checks",
             ";".join(charm_state.header_checks),
-        ),
-        "relay_access_sources": _create_map(
-            PostfixLookupTableType.CIDR,
-            "relay_access",
-            "\n".join(charm_state.relay_access_sources),
-        ),
-        "relay_recipient_maps": _create_map(
-            PostfixLookupTableType.HASH,
-            "relay_recipient",
-            "\n".join(
-                [f"{key} {value}" for key, value in charm_state.relay_recipient_maps.items()]
-            ),
-        ),
-        "restrict_recipients": _create_map(
-            PostfixLookupTableType.HASH,
-            "restricted_recipients",
-            "\n".join(
-                [f"{key} {value.value}" for key, value in charm_state.restrict_recipients.items()]
-            ),
-        ),
-        "restrict_senders": _create_map(
-            PostfixLookupTableType.HASH,
-            "restricted_senders",
-            "\n".join(
-                [f"{key} {value.value}" for key, value in charm_state.restrict_senders.items()]
-            ),
-        ),
-        "sender_access": _create_map(
-            PostfixLookupTableType.HASH,
-            "access",
-            "".join([f"{domain:35} OK\n" for domain in charm_state.restrict_sender_access]),
-        ),
-        "sender_login_maps": _create_map(
-            PostfixLookupTableType.HASH,
-            "sender_login",
-            "\n".join([f"{key} {value}" for key, value in charm_state.sender_login_maps.items()]),
         ),
         "smtp_header_checks": _create_map(
             PostfixLookupTableType.REGEXP,
@@ -225,16 +193,6 @@ def build_postfix_maps(postfix_conf_dir: str, charm_state: "State") -> dict[str,
             PostfixLookupTableType.HASH,
             "tls_policy",
             "\n".join([f"{key} {value}" for key, value in charm_state.tls_policy_maps.items()]),
-        ),
-        "transport_maps": _create_map(
-            PostfixLookupTableType.HASH,
-            "transport",
-            "\n".join([f"{key} {value}" for key, value in charm_state.transport_maps.items()]),
-        ),
-        "virtual_alias_maps": _create_map(
-            charm_state.virtual_alias_maps_type.value,
-            "virtual_alias",
-            "\n".join([f"{key} {value}" for key, value in charm_state.virtual_alias_maps.items()]),
         ),
     }
 
@@ -255,3 +213,95 @@ def construct_policyd_spf_config_file_content(spf_skip_addresses: "list[IPvAnyNe
         "skip_addresses": ",".join([str(address) for address in spf_skip_addresses]),
     }
     return utils.render_jinja2_template(context, "templates/policyd_spf_conf.tmpl")
+
+
+def _parse_access_map(raw_content: str) -> dict[str, AccessMapValue]:
+    return {key: AccessMapValue(value) for key, value in _parse_map(raw_content).items()}
+
+
+def _parse_map(raw_content: str) -> dict[str, str]:
+    return {line.split(" ")[0]: line.split(" ")[1] for line in raw_content.split("\n")}
+
+
+def _parse_list(raw_content: str) -> list[str]:
+    return raw_content.split("\n")
+
+
+def fetch_relay_access_sources() -> dict[str, AccessMapValue]:
+    """Parse relay access sources from the configuration files.
+
+    Returns:
+        the map of access sources.
+    """
+    path = POSTFIX_CONF_DIRPATH / "relay_access"
+    return _parse_access_map(path.read_text("utf-8"))
+
+
+def fetch_relay_recipient_maps() -> dict[str, str]:
+    """Parse relay recipient maps from the configuration files.
+
+    Returns:
+        the relay recipient maps.
+    """
+    path = POSTFIX_CONF_DIRPATH / "relay_recipient"
+    return _parse_map(path.read_text("utf-8"))
+
+
+def fetch_restrict_recipients() -> dict[str, AccessMapValue]:
+    """Parse restrict recipients from the configuration files.
+
+    Returns:
+        the restricted recipients maps.
+    """
+    path = POSTFIX_CONF_DIRPATH / "restricted_recipients"
+    return _parse_access_map(path.read_text("utf-8"))
+
+
+def fetch_restrict_senders() -> dict[str, AccessMapValue]:
+    """Parse restrict senders from the configuration files.
+
+    Returns:
+        the restricted senders maps.
+    """
+    path = POSTFIX_CONF_DIRPATH / "restricted_senders"
+    return _parse_access_map(path.read_text("utf-8"))
+
+
+def fetch_sender_access() -> list[str]:
+    """Parse sender access from the configuration files.
+
+    Returns:
+        the list of sender access addresses.
+    """
+    path = POSTFIX_CONF_DIRPATH / "access"
+    return [line.replace(" OK", "").strip() for line in _parse_list(path.read_text("utf-8"))]
+
+
+def fetch_sender_login_maps() -> dict[str, str]:
+    """Parse sender login maps from the configuration files.
+
+    Returns:
+        the sender login maps.
+    """
+    path = POSTFIX_CONF_DIRPATH / "sender_login"
+    return _parse_map(path.read_text("utf-8"))
+
+
+def fetch_transport_maps() -> dict[str, str]:
+    """Parse transport maps from the configuration files.
+
+    Returns:
+        the transport maps.
+    """
+    path = POSTFIX_CONF_DIRPATH / "transport_maps"
+    return _parse_map(path.read_text("utf-8"))
+
+
+def fetch_virtual_alias_maps() -> dict[str, str]:
+    """Parse virtual alias maps from the configuration files.
+
+    Returns:
+        the virtual alias maps.
+    """
+    path = POSTFIX_CONF_DIRPATH / "virtual_alias_maps"
+    return _parse_map(path.read_text("utf-8"))

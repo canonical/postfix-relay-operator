@@ -13,8 +13,8 @@ from ops.testing import Context, State
 from scenario import TCPPort
 
 import charm
+import state
 import tls
-from state import ConfigurationError
 
 if TYPE_CHECKING:
     from charms.operator_libs_linux.v1 import systemd
@@ -30,24 +30,16 @@ DEFAULT_TLS_CONFIG_PATHS = tls.TLSConfigPaths(
 )
 
 
-@patch("charm.utils.copy_file", Mock())
 @patch("charm.apt.add_package")
 def test_install(
     mock_add_package: Mock,
     context: Context[charm.PostfixRelayCharm],
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     arrange: Set up a charm state.
     act: Run the install event hook on the charm.
     assert: The unit status is set to maintenance and the correct packages are installed.
     """
-    log_rotate_syslog = tmp_path / "rsyslog"
-    log_rotate_syslog.write_text((FILES_PATH / "logrotate").read_text())
-    monkeypatch.setattr(charm, "LOG_ROTATE_SYSLOG", log_rotate_syslog)
-    expected_path = FILES_PATH / "logrotate_frequency"
-
     charm_state = State(config={}, leader=True)
 
     out = context.run(context.on.install(), charm_state)
@@ -57,10 +49,19 @@ def test_install(
         ["dovecot-core", "postfix", "postfix-policyd-spf-python"],
         update_cache=True,
     )
-    assert log_rotate_syslog.read_text() == expected_path.read_text()
 
 
-@patch("charm.State.from_charm", Mock(side_effect=ConfigurationError("Invalid configuration")))
+@patch(
+    "charm.State.from_charm", Mock(side_effect=state.ConfigurationError("Invalid configuration"))
+)
+@patch("charm.postfix.fetch_relay_access_sources", Mock(return_value={}))
+@patch("charm.postfix.fetch_relay_recipient_maps", Mock(return_value={}))
+@patch("charm.postfix.fetch_restrict_recipients", Mock(return_value={}))
+@patch("charm.postfix.fetch_sender_access", Mock(return_value=[]))
+@patch("charm.postfix.fetch_restrict_senders", Mock(return_value={}))
+@patch("charm.postfix.fetch_sender_login_maps", Mock(return_value={}))
+@patch("charm.postfix.fetch_transport_maps", Mock(return_value={}))
+@patch("charm.postfix.fetch_virtual_alias_maps", Mock(return_value={}))
 def test_invalid_config(context: Context[charm.PostfixRelayCharm]) -> None:
     """
     arrange: Invalid charm config.
@@ -75,6 +76,14 @@ def test_invalid_config(context: Context[charm.PostfixRelayCharm]) -> None:
 
 
 @patch("charm.subprocess.check_call", Mock())
+@patch("charm.postfix.fetch_relay_access_sources", Mock(return_value={}))
+@patch("charm.postfix.fetch_relay_recipient_maps", Mock(return_value={}))
+@patch("charm.postfix.fetch_restrict_recipients", Mock(return_value={}))
+@patch("charm.postfix.fetch_sender_access", Mock(return_value=[]))
+@patch("charm.postfix.fetch_restrict_senders", Mock(return_value={}))
+@patch("charm.postfix.fetch_sender_login_maps", Mock(return_value={}))
+@patch("charm.postfix.fetch_transport_maps", Mock(return_value={}))
+@patch("charm.postfix.fetch_virtual_alias_maps", Mock(return_value={}))
 class TestConfigureAuth:
     """Unit tests for _configure_auth."""
 
@@ -128,6 +137,14 @@ class TestConfigureAuth:
         "dovecot_running",
         [pytest.param(True, id="dovecot_running"), pytest.param(False, id="dovecot_not_running")],
     )
+    @patch("charm.postfix.fetch_relay_access_sources", Mock(return_value={}))
+    @patch("charm.postfix.fetch_relay_recipient_maps", Mock(return_value={}))
+    @patch("charm.postfix.fetch_restrict_recipients", Mock(return_value={}))
+    @patch("charm.postfix.fetch_sender_access", Mock(return_value=[]))
+    @patch("charm.postfix.fetch_restrict_senders", Mock(return_value={}))
+    @patch("charm.postfix.fetch_sender_login_maps", Mock(return_value={}))
+    @patch("charm.postfix.fetch_transport_maps", Mock(return_value={}))
+    @patch("charm.postfix.fetch_virtual_alias_maps", Mock(return_value={}))
     @patch("charm.systemd")
     @patch("charm.utils.write_file")
     def test_with_auth_dovecot(
@@ -170,11 +187,21 @@ class TestConfigureAuth:
     [pytest.param(True, id="postfix_running"), pytest.param(False, id="postfix_not_running")],
 )
 @patch.object(
-    charm, "construct_postfix_config_params", wraps=charm.construct_postfix_config_params
+    charm.postfix,
+    "construct_postfix_config_params",
+    wraps=charm.postfix.construct_postfix_config_params,
 )
 @patch.object(charm, "get_tls_config_paths", Mock(return_value=DEFAULT_TLS_CONFIG_PATHS))
 @patch("charm.systemd")
 @patch("charm.utils.write_file", Mock())
+@patch("charm.postfix.fetch_relay_access_sources", Mock(return_value={}))
+@patch("charm.postfix.fetch_relay_recipient_maps", Mock(return_value={}))
+@patch("charm.postfix.fetch_restrict_recipients", Mock(return_value={}))
+@patch("charm.postfix.fetch_sender_access", Mock(return_value=[]))
+@patch("charm.postfix.fetch_restrict_senders", Mock(return_value={}))
+@patch("charm.postfix.fetch_sender_login_maps", Mock(return_value={}))
+@patch("charm.postfix.fetch_transport_maps", Mock(return_value={}))
+@patch("charm.postfix.fetch_virtual_alias_maps", Mock(return_value={}))
 @patch("charm.subprocess.check_call")
 def test_configure_relay(
     mock_subprocess_check_call: Mock,
@@ -254,6 +281,7 @@ def test_configure_relay(
             call(["postmap", "hash:/etc/postfix/tls_policy"]),
             call(["postmap", "hash:/etc/postfix/transport"]),
             call(["postmap", "hash:/etc/postfix/virtual_alias"]),
+            call(["newaliases"]),
         ],
     )
     expected_systemd_call = call("postfix")
@@ -269,30 +297,21 @@ def test_configure_relay(
 
 
 class TestUpdateAliases:
-    @pytest.mark.parametrize(
-        ("changed"),
-        [pytest.param(True, id="change"), pytest.param(False, id="no_change")],
-    )
     @patch("charm.utils.write_file")
     @patch("charm.subprocess.check_call")
-    def test_update_aliases_calls_newaliases(
+    def testupdate_aliases_calls_newaliases(
         self,
         mock_check_call: Mock,
-        mock_write_file: Mock,
-        changed: bool,
+        _: Mock,
     ) -> None:
         """
-        arrange: Parameterize whether the aliases file content has changed.
-        act: Call the internal _update_aliases method.
+        arrange: do nothing.
+        act: Call the internal update_aliases method.
         assert: The 'newaliases' command is executed only if the file content changed.
         """
-        mock_write_file.return_value = changed
+        charm.PostfixRelayCharm.update_aliases("admin@email.com")
 
-        charm.PostfixRelayCharm._update_aliases("admin@email.com")
-        if changed:
-            mock_check_call.assert_called_once_with(["newaliases"])
-        else:
-            mock_check_call.assert_not_called()
+        mock_check_call.assert_called_once_with(["newaliases"])
 
     @pytest.mark.parametrize(
         "initial_content, expected_content",
@@ -332,7 +351,7 @@ class TestUpdateAliases:
         ],
     )
     @patch("charm.subprocess.check_call", Mock())
-    def test_update_aliases_content(
+    def testupdate_aliases_content(
         self,
         admin_email_address: str | None,
         initial_content: str,
@@ -342,7 +361,7 @@ class TestUpdateAliases:
     ) -> None:
         """
         arrange: Parametrize different initial contents.
-        act: Call the internal _update_aliases method.
+        act: Call the internal update_aliases method.
         assert: The content of the aliases file is updated to the expected state.
         """
         aliases_path = tmp_path / "aliases"
@@ -350,7 +369,7 @@ class TestUpdateAliases:
 
         monkeypatch.setattr(charm, "ALIASES_FILEPATH", aliases_path)
 
-        charm.PostfixRelayCharm._update_aliases(admin_email_address)
+        charm.PostfixRelayCharm.update_aliases(admin_email_address)
 
         if not admin_email_address:
             expected_content = "\n".join(
@@ -360,20 +379,20 @@ class TestUpdateAliases:
         assert aliases_path.read_text() == expected_content
 
     @patch("charm.subprocess.check_call", Mock())
-    def test_update_aliases_no_file(
+    def testupdate_aliases_no_file(
         self,
         tmp_path: "Path",
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """
         arrange: Define a path for an aliases file that does not exist.
-        act: Call the internal _update_aliases method.
+        act: Call the internal update_aliases method.
         assert: The method creates the aliases file with the correct default content.
         """
         non_existing_path = tmp_path / "aliases"
         monkeypatch.setattr(charm, "ALIASES_FILEPATH", non_existing_path)
 
-        charm.PostfixRelayCharm._update_aliases(None)
+        charm.PostfixRelayCharm.update_aliases(None)
 
         assert non_existing_path.is_file()
         assert non_existing_path.read_text() == "devnull:       /dev/null\n"
@@ -383,6 +402,14 @@ class TestUpdateAliases:
     "enable_spf",
     [pytest.param(True, id="enable_spf"), pytest.param(False, id="disable_spf")],
 )
+@patch("charm.postfix.fetch_relay_access_sources", Mock(return_value={}))
+@patch("charm.postfix.fetch_relay_recipient_maps", Mock(return_value={}))
+@patch("charm.postfix.fetch_restrict_recipients", Mock(return_value={}))
+@patch("charm.postfix.fetch_sender_access", Mock(return_value=[]))
+@patch("charm.postfix.fetch_restrict_senders", Mock(return_value={}))
+@patch("charm.postfix.fetch_sender_login_maps", Mock(return_value={}))
+@patch("charm.postfix.fetch_transport_maps", Mock(return_value={}))
+@patch("charm.postfix.fetch_virtual_alias_maps", Mock(return_value={}))
 @patch("charm.systemd", Mock())
 @patch("charm.subprocess.check_call", Mock())
 @patch("charm.utils.write_file")
